@@ -12,7 +12,7 @@ permissions:
 jobs:
   export:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -50,9 +50,28 @@ jobs:
           sha256sum dist/* | tee dist/SHA256SUMS
           tar -czf foundry-audit-toolchain.tar.gz -C dist .
 
+      - name: Export exact Seaport source snapshot
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --recurse-submodules https://github.com/ProjectOpenSea/seaport-1.6.git seaport-1.6
+          cd seaport-1.6
+          git checkout 4240dc6b30fa73f4b6b437fb588ebe583e796e3a
+          git submodule update --init --recursive
+          test "$(git rev-parse HEAD)" = "4240dc6b30fa73f4b6b437fb588ebe583e796e3a"
+          cd ..
+          tar --exclude='.git' --exclude='*/.git' -czf seaport-1.6-source.tar.gz seaport-1.6
+
       - name: Upload toolchain
         uses: actions/upload-artifact@v4
         with:
           name: foundry-audit-toolchain
           path: foundry-audit-toolchain.tar.gz
+          retention-days: 1
+
+      - name: Upload exact Seaport source
+        uses: actions/upload-artifact@v4
+        with:
+          name: seaport-1-6-source
+          path: seaport-1.6-source.tar.gz
           retention-days: 1
