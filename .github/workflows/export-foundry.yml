@@ -1,0 +1,58 @@
+name: Export Foundry audit toolchain
+
+on:
+  push:
+    branches:
+      - tooling-foundry-export-20260910
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Export binaries and pinned solc
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist src
+          cp "$(command -v forge)" dist/
+          cp "$(command -v cast)" dist/
+          cp "$(command -v anvil)" dist/
+          if command -v chisel >/dev/null; then cp "$(command -v chisel)" dist/; fi
+
+          cat > foundry.toml <<'EOF'
+          [profile.default]
+          solc = "0.8.24"
+          evm_version = "cancun"
+          EOF
+
+          cat > src/CompilerProbe.sol <<'EOF'
+          // SPDX-License-Identifier: MIT
+          pragma solidity 0.8.24;
+          contract CompilerProbe { function ok() external pure returns (bool) { return true; } }
+          EOF
+
+          forge build
+          SOLC_PATH="$(find "$HOME/.svm" -type f -name 'solc*0.8.24*' -perm -u+x | head -n 1)"
+          test -n "$SOLC_PATH"
+          cp "$SOLC_PATH" dist/solc-0.8.24
+          sha256sum dist/* | tee dist/SHA256SUMS
+          tar -czf foundry-audit-toolchain.tar.gz -C dist .
+
+      - name: Upload toolchain
+        uses: actions/upload-artifact@v4
+        with:
+          name: foundry-audit-toolchain
+          path: foundry-audit-toolchain.tar.gz
+          retention-days: 1
