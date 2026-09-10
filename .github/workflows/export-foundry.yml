@@ -12,7 +12,7 @@ permissions:
 jobs:
   export:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
@@ -50,7 +50,7 @@ jobs:
           sha256sum dist/* | tee dist/SHA256SUMS
           tar -czf foundry-audit-toolchain.tar.gz -C dist .
 
-      - name: Export exact Seaport source snapshot
+      - name: Export exact deployed Seaport source snapshot
         shell: bash
         run: |
           set -euxo pipefail
@@ -61,6 +61,18 @@ jobs:
           test "$(git rev-parse HEAD)" = "4240dc6b30fa73f4b6b437fb588ebe583e796e3a"
           cd ..
           tar --exclude='.git' --exclude='*/.git' -czf seaport-1.6-source.tar.gz seaport-1.6
+
+      - name: Export current Seaport core snapshot
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --recurse-submodules https://github.com/ProjectOpenSea/seaport-core.git seaport-core-current
+          cd seaport-core-current
+          git checkout 523097f9cee66c15d308c900c50f336b291cda08
+          git submodule update --init --recursive
+          test "$(git rev-parse HEAD)" = "523097f9cee66c15d308c900c50f336b291cda08"
+          cd ..
+          tar --exclude='.git' --exclude='*/.git' -czf seaport-core-current.tar.gz seaport-core-current
 
       - name: Upload toolchain
         uses: actions/upload-artifact@v4
@@ -74,4 +86,11 @@ jobs:
         with:
           name: seaport-1-6-source
           path: seaport-1.6-source.tar.gz
+          retention-days: 1
+
+      - name: Upload current Seaport core
+        uses: actions/upload-artifact@v4
+        with:
+          name: seaport-core-current
+          path: seaport-core-current.tar.gz
           retention-days: 1
