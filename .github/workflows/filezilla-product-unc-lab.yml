@@ -14,11 +14,12 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - name: Install FileZilla 3.71.1
+      - name: Install and verify FileZilla 3.71.1
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           choco install filezilla --version=3.71.1 -y --no-progress
+
           $exe = 'C:\Program Files\FileZilla FTP Client\filezilla.exe'
           if (-not (Test-Path $exe)) {
               $exe = 'C:\Program Files (x86)\FileZilla FTP Client\filezilla.exe'
@@ -26,33 +27,40 @@ jobs:
           if (-not (Test-Path $exe)) { throw 'FileZilla executable not found' }
 
           $version = (Get-Item $exe).VersionInfo.ProductVersion
+          $normalizedVersion = (($version -replace '[^0-9]+', '.') -replace '^\.|\.$', '')
           $sig = Get-AuthenticodeSignature $exe
+          $hash = Get-FileHash -Algorithm SHA256 $exe
+
           "Executable: $exe" | Set-Content filezilla-build.txt
           "ProductVersion: $version" | Add-Content filezilla-build.txt
+          "NormalizedVersion: $normalizedVersion" | Add-Content filezilla-build.txt
           "SignatureStatus: $($sig.Status)" | Add-Content filezilla-build.txt
           "Signer: $($sig.SignerCertificate.Subject)" | Add-Content filezilla-build.txt
-          Get-FileHash -Algorithm SHA256 $exe | Format-List | Out-String | Add-Content filezilla-build.txt
+          "SHA256: $($hash.Hash)" | Add-Content filezilla-build.txt
           Get-Content filezilla-build.txt
 
-          if ($version -notlike '3.71.1*') { throw "Unexpected FileZilla version: $version" }
-          "FZ_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if ($normalizedVersion -notlike '3.71.1*') {
+              throw "Unexpected FileZilla version: $version"
+          }
+          if ($sig.Status -ne 'Valid') {
+              throw "Invalid FileZilla Authenticode signature: $($sig.Status)"
+          }
 
-      - name: Prepare isolated FileZilla profile
+          "FZ_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "FZ_EXE_DIR=$([IO.Path]::GetDirectoryName($exe))" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Prepare forced isolated FileZilla profile
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $profile = Join-Path $PWD 'profile'
-          $appdata = Join-Path $profile 'AppData\Roaming'
-          $localappdata = Join-Path $profile 'AppData\Local'
-          $config = Join-Path $appdata 'FileZilla'
-          New-Item -ItemType Directory -Force $config,$localappdata | Out-Null
+          $config = Join-Path $PWD 'filezilla-profile'
+          New-Item -ItemType Directory -Force $config | Out-Null
 
           @'
           <?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
           <FileZilla3>
             <Settings>
               <Setting name="Update Check">0</Setting>
-              <Setting name="Show debug menu">1</Setting>
             </Settings>
           </FileZilla3>
           '@ | Set-Content -Encoding utf8 (Join-Path $config 'filezilla.xml')
@@ -66,9 +74,21 @@ jobs:
           </FileZilla3>
           '@ | Set-Content -Encoding utf8 (Join-Path $config 'trustedcerts.xml')
 
-          "FZ_PROFILE=$profile" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "FZ_APPDATA=$appdata" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "FZ_LOCALAPPDATA=$localappdata" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $escapedConfig = [Security.SecurityElement]::Escape(($config + '\'))
+          @"
+          <?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+          <FileZilla3>
+            <Settings>
+              <Setting name="Config Location">$escapedConfig</Setting>
+              <Setting name="Disable update check">1</Setting>
+              <Setting name="Kiosk mode">0</Setting>
+            </Settings>
+          </FileZilla3>
+          "@ | Set-Content -Encoding utf8 (Join-Path $env:FZ_EXE_DIR 'fzdefaults.xml')
+
+          "FZ_CONFIG=$config" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Get-Content (Join-Path $env:FZ_EXE_DIR 'fzdefaults.xml')
+          Get-Content (Join-Path $config 'trustedcerts.xml')
 
       - name: Create localhost-only FTP listing server
         shell: pwsh
@@ -85,17 +105,12 @@ jobs:
           LOG = Path("ftp-server.log")
           READY = Path("ftp-server.ready")
           STOP = Path("ftp-server.stop")
+          MARKER = Path("listing-served.marker")
 
           LISTING = (
               b"-rw-r--r-- 1 owner group 1 Sep 30 18:00 "
               b"\\\\192.0.2.20\\share\\ordinary.txt\r\n"
               b"-rw-r--r-- 1 owner group 1 Sep 30 18:00 "
-              b"\\\\192.0.2.21\\share\\probe.lnk\r\n"
-          )
-          MLSD = (
-              b"type=file;size=1;modify=20260930180000; "
-              b"\\\\192.0.2.20\\share\\ordinary.txt\r\n"
-              b"type=file;size=1;modify=20260930180000; "
               b"\\\\192.0.2.21\\share\\probe.lnk\r\n"
           )
 
@@ -107,6 +122,10 @@ jobs:
                   with LOG.open("a", encoding="utf-8") as f:
                       f.write(message + "\n")
                       f.flush()
+
+          def send_line(conn, line):
+              log("S: " + line)
+              conn.sendall((line + "\r\n").encode("ascii"))
 
           def make_data_listener():
               global data_listener
@@ -122,33 +141,30 @@ jobs:
               data_listener.settimeout(10)
               return data_listener.getsockname()[1]
 
-          def send_line(conn, line):
-              log("S: " + line)
-              conn.sendall((line + "\r\n").encode("ascii"))
-
           def serve_client(conn, address):
               global data_listener
               log(f"CONTROL {address}")
               conn.settimeout(30)
               send_line(conn, "220 FileZilla authorized localhost test")
               buf = b""
+
               while not STOP.exists():
                   chunk = conn.recv(4096)
                   if not chunk:
                       break
                   buf += chunk
+
                   while b"\n" in buf:
                       raw, buf = buf.split(b"\n", 1)
                       command = raw.rstrip(b"\r").decode("utf-8", "replace")
                       log("C: " + command)
-                      verb, _, arg = command.partition(" ")
-                      verb = verb.upper()
+                      verb = command.partition(" ")[0].upper()
 
                       if verb == "USER":
                           send_line(conn, "331 Password required")
                       elif verb == "PASS":
                           send_line(conn, "230 Logged on")
-                      elif verb in {"AUTH"}:
+                      elif verb == "AUTH":
                           send_line(conn, "500 TLS deliberately unavailable in localhost test")
                       elif verb == "SYST":
                           send_line(conn, "215 UNIX Type: L8")
@@ -176,14 +192,13 @@ jobs:
                           send_line(conn, "150 Opening data connection")
                           data, peer = data_listener.accept()
                           log(f"DATA {peer} for {verb}")
-                          payload = MLSD if verb == "MLSD" else LISTING
-                          data.sendall(payload)
+                          data.sendall(LISTING)
                           data.shutdown(socket.SHUT_WR)
                           data.close()
                           data_listener.close()
                           data_listener = None
                           send_line(conn, "226 Transfer complete")
-                          Path("listing-served.marker").write_text(verb, encoding="ascii")
+                          MARKER.write_text(verb, encoding="ascii")
                       elif verb == "QUIT":
                           send_line(conn, "221 Goodbye")
                           return
@@ -192,6 +207,12 @@ jobs:
 
           def main():
               LOG.write_text("", encoding="utf-8")
+              for path in (READY, STOP, MARKER):
+                  try:
+                      path.unlink()
+                  except FileNotFoundError:
+                      pass
+
               server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
               server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
               server.bind((HOST, PORT))
@@ -200,6 +221,7 @@ jobs:
               READY.write_text("ready", encoding="ascii")
               log(f"LISTEN {HOST}:{PORT}")
               deadline = time.time() + 90
+
               try:
                   while time.time() < deadline and not STOP.exists():
                       try:
@@ -226,7 +248,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force results | Out-Null
 
-          $server = Start-Process python -ArgumentList @('ftp_server.py') -RedirectStandardOutput results/ftp-python.stdout.txt -RedirectStandardError results/ftp-python.stderr.txt -PassThru
+          $server = Start-Process python -ArgumentList @('ftp_server.py') `
+              -RedirectStandardOutput results/ftp-python.stdout.txt `
+              -RedirectStandardError results/ftp-python.stderr.txt -PassThru
+
           $deadline = [DateTime]::UtcNow.AddSeconds(15)
           while (-not (Test-Path ftp-server.ready) -and [DateTime]::UtcNow -lt $deadline) {
               Start-Sleep -Milliseconds 100
@@ -237,15 +262,11 @@ jobs:
           pktmon filter add -p 445 | Out-File -Encoding utf8 results/pktmon-filter.txt
           pktmon start --capture --pkt-size 0 --file-name results/pktmon.etl | Out-File -Encoding utf8 results/pktmon-start.txt
 
-          $oldUserProfile = $env:USERPROFILE
-          $oldAppData = $env:APPDATA
-          $oldLocalAppData = $env:LOCALAPPDATA
-          $env:USERPROFILE = $env:FZ_PROFILE
-          $env:APPDATA = $env:FZ_APPDATA
-          $env:LOCALAPPDATA = $env:FZ_LOCALAPPDATA
-
+          $fz = $null
           try {
-              $fz = Start-Process -FilePath $env:FZ_EXE -ArgumentList @('ftp://test:test@127.0.0.1:2121/') -PassThru
+              $fz = Start-Process -FilePath $env:FZ_EXE `
+                  -ArgumentList @('ftp://test:test@127.0.0.1:2121/') -PassThru
+
               $deadline = [DateTime]::UtcNow.AddSeconds(35)
               while (-not (Test-Path listing-served.marker) -and [DateTime]::UtcNow -lt $deadline -and -not $fz.HasExited) {
                   Start-Sleep -Milliseconds 200
@@ -254,13 +275,9 @@ jobs:
                   throw 'FileZilla did not retrieve the remote listing'
               }
 
-              # Allow virtual list rendering and Shell icon/type requests to complete.
               Start-Sleep -Seconds 12
           }
           finally {
-              $env:USERPROFILE = $oldUserProfile
-              $env:APPDATA = $oldAppData
-              $env:LOCALAPPDATA = $oldLocalAppData
               if ($fz -and -not $fz.HasExited) { $fz.Kill($true) }
               'stop' | Set-Content ftp-server.stop
               if ($server -and -not $server.WaitForExit(5000)) { $server.Kill($true) }
@@ -268,9 +285,9 @@ jobs:
           }
 
           Copy-Item ftp-server.log results/ftp-server.log
-          if (Test-Path listing-served.marker) { Copy-Item listing-served.marker results/listing-served.marker }
           Copy-Item filezilla-build.txt results/filezilla-build.txt
-          Copy-Item -Recurse -Force $env:FZ_APPDATA results/FileZilla-profile
+          Copy-Item -Recurse -Force $env:FZ_CONFIG results/FileZilla-profile
+          if (Test-Path listing-served.marker) { Copy-Item listing-served.marker results/listing-served.marker }
 
           pktmon format results/pktmon.etl -o results/pktmon.txt | Out-File -Encoding utf8 results/pktmon-format.txt
           Get-Content results/pktmon.txt | Select-String -Pattern '192\.0\.2\.(20|21)|445' |
@@ -293,6 +310,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: filezilla-3.71.1-product-unc-results
-          path: results/**
-          if-no-files-found: error
+          path: |
+            results/**
+            filezilla-build.txt
+            ftp_server.py
+          if-no-files-found: warn
           retention-days: 7
