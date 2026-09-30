@@ -1,0 +1,54 @@
+name: FileZilla extended CodeQL lab
+
+on:
+  push:
+    branches:
+      - filezilla-native-lab-20260930
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out FileZilla 3.71.1 mirror snapshot
+        uses: actions/checkout@v4
+        with:
+          repository: fffaraz/FileZilla
+          ref: dfb3f6135b456796c50cc4e27f1a0c5ea91a268a
+          fetch-depth: 1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: none
+          queries: security-and-quality
+
+      - name: Analyze without uploading to repository security alerts
+        uses: github/codeql-action/analyze@v3
+        with:
+          output: sarif-results
+          upload: false
+
+      - name: Package analysis results
+        shell: bash
+        run: |
+          set -euo pipefail
+          find sarif-results -maxdepth 2 -type f -print
+          tar -czf filezilla-codeql-sarif.tar.gz sarif-results
+          sha256sum filezilla-codeql-sarif.tar.gz > filezilla-codeql-sarif.tar.gz.sha256
+
+      - name: Upload analysis results
+        uses: actions/upload-artifact@v4
+        with:
+          name: filezilla-codeql-sarif
+          path: |
+            filezilla-codeql-sarif.tar.gz
+            filezilla-codeql-sarif.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
