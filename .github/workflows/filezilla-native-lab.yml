@@ -1,0 +1,211 @@
+name: FileZilla native validation lab
+
+on:
+  push:
+    branches:
+      - filezilla-native-lab-20260930
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-shell-probe:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Build exact Shell API probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          #define UNICODE
+          #define _UNICODE
+          #include <windows.h>
+          #include <shellapi.h>
+          #include <stdio.h>
+          #include <string>
+
+          int wmain(int argc, wchar_t** argv) {
+              if (argc != 4) {
+                  fwprintf(stderr, L"usage: shell_probe <host> <name> <mode>\n");
+                  return 2;
+              }
+
+              std::wstring path = L"\\\\";
+              path += argv[1];
+              path += L"\\share\\";
+              path += argv[2];
+              const std::wstring mode = argv[3];
+
+              if (mode == L"attributes") {
+                  SetLastError(ERROR_SUCCESS);
+                  DWORD attrs = GetFileAttributesW(path.c_str());
+                  wprintf(L"mode=attributes path=%ls attrs=0x%08lx error=%lu\n",
+                          path.c_str(), attrs, GetLastError());
+                  return 0;
+              }
+
+              SHFILEINFOW info{};
+              UINT flags = SHGFI_ICON | SHGFI_SMALLICON;
+              if (mode == L"exact") {
+                  flags |= SHGFI_USEFILEATTRIBUTES;
+              }
+              else if (mode != L"control") {
+                  fwprintf(stderr, L"unknown mode\n");
+                  return 2;
+              }
+
+              SetLastError(ERROR_SUCCESS);
+              DWORD_PTR iconResult = SHGetFileInfoW(
+                  path.c_str(), FILE_ATTRIBUTE_NORMAL, &info, sizeof(info), flags);
+              DWORD iconError = GetLastError();
+              if (info.hIcon) {
+                  DestroyIcon(info.hIcon);
+              }
+
+              ZeroMemory(&info, sizeof(info));
+              SetLastError(ERROR_SUCCESS);
+              UINT typeFlags = SHGFI_TYPENAME;
+              if (mode == L"exact") {
+                  typeFlags |= SHGFI_USEFILEATTRIBUTES;
+              }
+              DWORD_PTR typeResult = SHGetFileInfoW(
+                  path.c_str(), FILE_ATTRIBUTE_NORMAL, &info, sizeof(info), typeFlags);
+              DWORD typeError = GetLastError();
+
+              wprintf(L"mode=%ls path=%ls icon_result=%llu icon_error=%lu type_result=%llu type_error=%lu type=%ls\n",
+                      mode.c_str(), path.c_str(),
+                      static_cast<unsigned long long>(iconResult), iconError,
+                      static_cast<unsigned long long>(typeResult), typeError,
+                      info.szTypeName);
+              return 0;
+          }
+          '@ | Set-Content -Encoding utf8 shell_probe.cpp
+
+          & cl.exe /nologo /EHsc /W4 /DUNICODE /D_UNICODE shell_probe.cpp shell32.lib user32.lib /Fe:shell_probe.exe
+          if ($LASTEXITCODE -ne 0) { throw "cl.exe failed: $LASTEXITCODE" }
+
+      - name: Run callback tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force results | Out-Null
+
+          # Free TCP/445 from the local SMB server while keeping the SMB client active.
+          Stop-Service -Name LanmanServer -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+
+          function Invoke-CallbackCase {
+              param(
+                  [Parameter(Mandatory=$true)][string]$Case,
+                  [Parameter(Mandatory=$true)][string]$HostAddress,
+                  [Parameter(Mandatory=$true)][string]$Name,
+                  [Parameter(Mandatory=$true)][string]$Mode
+              )
+
+              $listenerScript = Join-Path $PWD "listener-$Case.ps1"
+              $callbackLog = Join-Path $PWD "results\\$Case-callback.txt"
+              $probeLog = Join-Path $PWD "results\\$Case-probe.txt"
+              $escapedLog = $callbackLog.Replace("'", "''")
+
+              @"
+              `$ErrorActionPreference = 'Stop'
+              `$log = '$escapedLog'
+              `$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, 445)
+              `$listener.Start()
+              try {
+                  `$deadline = [DateTime]::UtcNow.AddSeconds(8)
+                  `$connected = `$false
+                  while ([DateTime]::UtcNow -lt `$deadline) {
+                      if (`$listener.Pending()) {
+                          `$client = `$listener.AcceptTcpClient()
+                          try {
+                              # Deliberately do not read any bytes or credentials.
+                              "CALLBACK remote=`$(`$client.Client.RemoteEndPoint) local=`$(`$client.Client.LocalEndPoint)" | Set-Content -Encoding ascii `$log
+                          }
+                          finally {
+                              `$client.Close()
+                          }
+                          `$connected = `$true
+                          break
+                      }
+                      Start-Sleep -Milliseconds 50
+                  }
+                  if (-not `$connected) {
+                      'NO_CALLBACK' | Set-Content -Encoding ascii `$log
+                  }
+              }
+              finally {
+                  `$listener.Stop()
+              }
+              "@ | Set-Content -Encoding utf8 $listenerScript
+
+              $listener = Start-Process pwsh -ArgumentList @('-NoLogo','-NoProfile','-File', $listenerScript) -PassThru
+              Start-Sleep -Milliseconds 750
+              try {
+                  & .\\shell_probe.exe $HostAddress $Name $Mode *>&1 | Set-Content -Encoding utf8 $probeLog
+              }
+              finally {
+                  if (-not $listener.WaitForExit(12000)) {
+                      $listener.Kill()
+                      throw "listener timed out in $Case"
+                  }
+              }
+
+              "=== $Case ==="
+              Get-Content $probeLog
+              Get-Content $callbackLog
+          }
+
+          # Exact FileZilla flags, tested against an ordinary extension and a shortcut extension.
+          Invoke-CallbackCase -Case 'exact-txt' -HostAddress '127.0.0.2' -Name 'probe.txt' -Mode 'exact'
+          Invoke-CallbackCase -Case 'exact-lnk' -HostAddress '127.0.0.3' -Name 'probe.lnk' -Mode 'exact'
+
+          # Positive controls prove that the listener sees outbound UNC resolution attempts.
+          Invoke-CallbackCase -Case 'shell-control-lnk' -HostAddress '127.0.0.4' -Name 'probe.lnk' -Mode 'control'
+          Invoke-CallbackCase -Case 'attributes-control' -HostAddress '127.0.0.5' -Name 'probe.txt' -Mode 'attributes'
+
+          Get-ChildItem results | Format-Table -AutoSize
+
+      - name: Upload native results
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-shell-results
+          path: |
+            results/**
+            shell_probe.cpp
+            shell_probe.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  source-export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out FileZilla 3.71.1 mirror snapshot
+        uses: actions/checkout@v4
+        with:
+          repository: fffaraz/FileZilla
+          ref: dfb3f6135b456796c50cc4e27f1a0c5ea91a268a
+          path: target
+          fetch-depth: 1
+
+      - name: Package source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --sort=name --mtime='UTC 2026-08-26' --owner=0 --group=0 --numeric-owner \
+              -czf filezilla-3.71.1-mirror-source.tar.gz target
+          sha256sum filezilla-3.71.1-mirror-source.tar.gz > filezilla-3.71.1-mirror-source.tar.gz.sha256
+          cat filezilla-3.71.1-mirror-source.tar.gz.sha256
+
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: filezilla-3.71.1-mirror-source
+          path: |
+            filezilla-3.71.1-mirror-source.tar.gz
+            filezilla-3.71.1-mirror-source.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
