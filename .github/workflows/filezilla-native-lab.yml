@@ -88,7 +88,7 @@ jobs:
           }
           '@ | Set-Content -Encoding utf8 shell_probe.cpp
 
-          & cl.exe /nologo /EHsc /W4 /DUNICODE /D_UNICODE shell_probe.cpp shell32.lib user32.lib /Fe:shell_probe.exe
+          & cl.exe /nologo /EHsc /W4 shell_probe.cpp shell32.lib user32.lib /Fe:shell_probe.exe
           if ($LASTEXITCODE -ne 0) { throw "cl.exe failed: $LASTEXITCODE" }
 
       - name: Run callback tests
@@ -109,53 +109,60 @@ jobs:
                   [Parameter(Mandatory=$true)][string]$Mode
               )
 
-              $listenerScript = Join-Path $PWD "listener-$Case.ps1"
               $callbackLog = Join-Path $PWD "results\\$Case-callback.txt"
               $probeLog = Join-Path $PWD "results\\$Case-probe.txt"
-              $escapedLog = $callbackLog.Replace("'", "''")
 
-              @"
-              `$ErrorActionPreference = 'Stop'
-              `$log = '$escapedLog'
-              `$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, 445)
-              `$listener.Start()
-              try {
-                  `$deadline = [DateTime]::UtcNow.AddSeconds(8)
-                  `$connected = `$false
-                  while ([DateTime]::UtcNow -lt `$deadline) {
-                      if (`$listener.Pending()) {
-                          `$client = `$listener.AcceptTcpClient()
-                          try {
-                              # Deliberately do not read any bytes or credentials.
-                              "CALLBACK remote=`$(`$client.Client.RemoteEndPoint) local=`$(`$client.Client.LocalEndPoint)" | Set-Content -Encoding ascii `$log
+              $listenerJob = Start-Job -ArgumentList $callbackLog -ScriptBlock {
+                  param([string]$Log)
+                  $ErrorActionPreference = 'Stop'
+                  $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, 445)
+                  try {
+                      $listener.Start()
+                      $deadline = [DateTime]::UtcNow.AddSeconds(8)
+                      $connected = $false
+                      while ([DateTime]::UtcNow -lt $deadline) {
+                          if ($listener.Pending()) {
+                              $client = $listener.AcceptTcpClient()
+                              try {
+                                  # Deliberately do not read any bytes or credentials.
+                                  "CALLBACK remote=$($client.Client.RemoteEndPoint) local=$($client.Client.LocalEndPoint)" |
+                                      Set-Content -Encoding ascii $Log
+                              }
+                              finally {
+                                  $client.Close()
+                              }
+                              $connected = $true
+                              break
                           }
-                          finally {
-                              `$client.Close()
-                          }
-                          `$connected = `$true
-                          break
+                          Start-Sleep -Milliseconds 50
                       }
-                      Start-Sleep -Milliseconds 50
+                      if (-not $connected) {
+                          'NO_CALLBACK' | Set-Content -Encoding ascii $Log
+                      }
                   }
-                  if (-not `$connected) {
-                      'NO_CALLBACK' | Set-Content -Encoding ascii `$log
+                  catch {
+                      "LISTENER_ERROR: $($_.Exception.Message)" | Set-Content -Encoding ascii $Log
+                      throw
+                  }
+                  finally {
+                      $listener.Stop()
                   }
               }
-              finally {
-                  `$listener.Stop()
-              }
-              "@ | Set-Content -Encoding utf8 $listenerScript
 
-              $listener = Start-Process pwsh -ArgumentList @('-NoLogo','-NoProfile','-File', $listenerScript) -PassThru
               Start-Sleep -Milliseconds 750
-              try {
-                  & .\\shell_probe.exe $HostAddress $Name $Mode *>&1 | Set-Content -Encoding utf8 $probeLog
+              & .\\shell_probe.exe $HostAddress $Name $Mode *>&1 | Set-Content -Encoding utf8 $probeLog
+
+              $completed = Wait-Job -Job $listenerJob -Timeout 12
+              if (-not $completed) {
+                  Stop-Job -Job $listenerJob
+                  Remove-Job -Job $listenerJob -Force
+                  throw "listener timed out in $Case"
               }
-              finally {
-                  if (-not $listener.WaitForExit(12000)) {
-                      $listener.Kill()
-                      throw "listener timed out in $Case"
-                  }
+
+              Receive-Job -Job $listenerJob -ErrorAction Stop | Out-Null
+              Remove-Job -Job $listenerJob -Force
+              if (-not (Test-Path $callbackLog)) {
+                  throw "listener produced no result in $Case"
               }
 
               "=== $Case ==="
@@ -174,6 +181,7 @@ jobs:
           Get-ChildItem results | Format-Table -AutoSize
 
       - name: Upload native results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: native-windows-shell-results
@@ -181,36 +189,5 @@ jobs:
             results/**
             shell_probe.cpp
             shell_probe.exe
-          if-no-files-found: error
-          retention-days: 7
-
-  source-export:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Check out FileZilla 3.71.1 mirror snapshot
-        uses: actions/checkout@v4
-        with:
-          repository: fffaraz/FileZilla
-          ref: dfb3f6135b456796c50cc4e27f1a0c5ea91a268a
-          path: target
-          fetch-depth: 1
-
-      - name: Package source snapshot
-        shell: bash
-        run: |
-          set -euo pipefail
-          tar --sort=name --mtime='UTC 2026-08-26' --owner=0 --group=0 --numeric-owner \
-              -czf filezilla-3.71.1-mirror-source.tar.gz target
-          sha256sum filezilla-3.71.1-mirror-source.tar.gz > filezilla-3.71.1-mirror-source.tar.gz.sha256
-          cat filezilla-3.71.1-mirror-source.tar.gz.sha256
-
-      - name: Upload source snapshot
-        uses: actions/upload-artifact@v4
-        with:
-          name: filezilla-3.71.1-mirror-source
-          path: |
-            filezilla-3.71.1-mirror-source.tar.gz
-            filezilla-3.71.1-mirror-source.tar.gz.sha256
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 7
