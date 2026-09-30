@@ -1,0 +1,298 @@
+name: FileZilla 3.71.1 end-to-end UNC listing lab
+
+on:
+  push:
+    branches:
+      - filezilla-native-lab-20260930
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  product-test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install FileZilla 3.71.1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install filezilla --version=3.71.1 -y --no-progress
+          $exe = 'C:\Program Files\FileZilla FTP Client\filezilla.exe'
+          if (-not (Test-Path $exe)) {
+              $exe = 'C:\Program Files (x86)\FileZilla FTP Client\filezilla.exe'
+          }
+          if (-not (Test-Path $exe)) { throw 'FileZilla executable not found' }
+
+          $version = (Get-Item $exe).VersionInfo.ProductVersion
+          $sig = Get-AuthenticodeSignature $exe
+          "Executable: $exe" | Set-Content filezilla-build.txt
+          "ProductVersion: $version" | Add-Content filezilla-build.txt
+          "SignatureStatus: $($sig.Status)" | Add-Content filezilla-build.txt
+          "Signer: $($sig.SignerCertificate.Subject)" | Add-Content filezilla-build.txt
+          Get-FileHash -Algorithm SHA256 $exe | Format-List | Out-String | Add-Content filezilla-build.txt
+          Get-Content filezilla-build.txt
+
+          if ($version -notlike '3.71.1*') { throw "Unexpected FileZilla version: $version" }
+          "FZ_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Prepare isolated FileZilla profile
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $profile = Join-Path $PWD 'profile'
+          $appdata = Join-Path $profile 'AppData\Roaming'
+          $localappdata = Join-Path $profile 'AppData\Local'
+          $config = Join-Path $appdata 'FileZilla'
+          New-Item -ItemType Directory -Force $config,$localappdata | Out-Null
+
+          @'
+          <?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+          <FileZilla3>
+            <Settings>
+              <Setting name="Update Check">0</Setting>
+              <Setting name="Show debug menu">1</Setting>
+            </Settings>
+          </FileZilla3>
+          '@ | Set-Content -Encoding utf8 (Join-Path $config 'filezilla.xml')
+
+          @'
+          <?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+          <FileZilla3>
+            <InsecureHosts>
+              <Host Port="2121">127.0.0.1</Host>
+            </InsecureHosts>
+          </FileZilla3>
+          '@ | Set-Content -Encoding utf8 (Join-Path $config 'trustedcerts.xml')
+
+          "FZ_PROFILE=$profile" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "FZ_APPDATA=$appdata" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "FZ_LOCALAPPDATA=$localappdata" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Create localhost-only FTP listing server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import socket
+          import threading
+          import time
+          from pathlib import Path
+
+          HOST = "127.0.0.1"
+          PORT = 2121
+          LOG = Path("ftp-server.log")
+          READY = Path("ftp-server.ready")
+          STOP = Path("ftp-server.stop")
+
+          LISTING = (
+              b"-rw-r--r-- 1 owner group 1 Sep 30 18:00 "
+              b"\\\\192.0.2.20\\share\\ordinary.txt\r\n"
+              b"-rw-r--r-- 1 owner group 1 Sep 30 18:00 "
+              b"\\\\192.0.2.21\\share\\probe.lnk\r\n"
+          )
+          MLSD = (
+              b"type=file;size=1;modify=20260930180000; "
+              b"\\\\192.0.2.20\\share\\ordinary.txt\r\n"
+              b"type=file;size=1;modify=20260930180000; "
+              b"\\\\192.0.2.21\\share\\probe.lnk\r\n"
+          )
+
+          lock = threading.Lock()
+          data_listener = None
+
+          def log(message):
+              with lock:
+                  with LOG.open("a", encoding="utf-8") as f:
+                      f.write(message + "\n")
+                      f.flush()
+
+          def make_data_listener():
+              global data_listener
+              if data_listener is not None:
+                  try:
+                      data_listener.close()
+                  except OSError:
+                      pass
+              data_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              data_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              data_listener.bind((HOST, 0))
+              data_listener.listen(1)
+              data_listener.settimeout(10)
+              return data_listener.getsockname()[1]
+
+          def send_line(conn, line):
+              log("S: " + line)
+              conn.sendall((line + "\r\n").encode("ascii"))
+
+          def serve_client(conn, address):
+              global data_listener
+              log(f"CONTROL {address}")
+              conn.settimeout(30)
+              send_line(conn, "220 FileZilla authorized localhost test")
+              buf = b""
+              while not STOP.exists():
+                  chunk = conn.recv(4096)
+                  if not chunk:
+                      break
+                  buf += chunk
+                  while b"\n" in buf:
+                      raw, buf = buf.split(b"\n", 1)
+                      command = raw.rstrip(b"\r").decode("utf-8", "replace")
+                      log("C: " + command)
+                      verb, _, arg = command.partition(" ")
+                      verb = verb.upper()
+
+                      if verb == "USER":
+                          send_line(conn, "331 Password required")
+                      elif verb == "PASS":
+                          send_line(conn, "230 Logged on")
+                      elif verb in {"AUTH"}:
+                          send_line(conn, "500 TLS deliberately unavailable in localhost test")
+                      elif verb == "SYST":
+                          send_line(conn, "215 UNIX Type: L8")
+                      elif verb == "FEAT":
+                          send_line(conn, "211-Features")
+                          send_line(conn, " UTF8")
+                          send_line(conn, " EPSV")
+                          send_line(conn, "211 End")
+                      elif verb in {"CLNT", "OPTS", "TYPE", "NOOP"}:
+                          send_line(conn, "200 OK")
+                      elif verb == "PWD":
+                          send_line(conn, '257 "/" is current directory')
+                      elif verb in {"CWD", "CDUP"}:
+                          send_line(conn, "250 Directory changed")
+                      elif verb == "EPSV":
+                          port = make_data_listener()
+                          send_line(conn, f"229 Entering Extended Passive Mode (|||{port}|)")
+                      elif verb == "PASV":
+                          port = make_data_listener()
+                          send_line(conn, f"227 Entering Passive Mode (127,0,0,1,{port // 256},{port % 256})")
+                      elif verb in {"LIST", "MLSD"}:
+                          if data_listener is None:
+                              send_line(conn, "425 Use PASV or EPSV first")
+                              continue
+                          send_line(conn, "150 Opening data connection")
+                          data, peer = data_listener.accept()
+                          log(f"DATA {peer} for {verb}")
+                          payload = MLSD if verb == "MLSD" else LISTING
+                          data.sendall(payload)
+                          data.shutdown(socket.SHUT_WR)
+                          data.close()
+                          data_listener.close()
+                          data_listener = None
+                          send_line(conn, "226 Transfer complete")
+                          Path("listing-served.marker").write_text(verb, encoding="ascii")
+                      elif verb == "QUIT":
+                          send_line(conn, "221 Goodbye")
+                          return
+                      else:
+                          send_line(conn, "200 OK")
+
+          def main():
+              LOG.write_text("", encoding="utf-8")
+              server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              server.bind((HOST, PORT))
+              server.listen(5)
+              server.settimeout(1)
+              READY.write_text("ready", encoding="ascii")
+              log(f"LISTEN {HOST}:{PORT}")
+              deadline = time.time() + 90
+              try:
+                  while time.time() < deadline and not STOP.exists():
+                      try:
+                          conn, address = server.accept()
+                      except socket.timeout:
+                          continue
+                      try:
+                          serve_client(conn, address)
+                      except Exception as exc:
+                          log(f"CLIENT_ERROR {type(exc).__name__}: {exc}")
+                      finally:
+                          conn.close()
+              finally:
+                  server.close()
+                  log("STOP")
+
+          if __name__ == "__main__":
+              main()
+          '@ | Set-Content -Encoding utf8 ftp_server.py
+
+      - name: Run FileZilla and observe listing-triggered SMB attempts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force results | Out-Null
+
+          $server = Start-Process python -ArgumentList @('ftp_server.py') -RedirectStandardOutput results/ftp-python.stdout.txt -RedirectStandardError results/ftp-python.stderr.txt -PassThru
+          $deadline = [DateTime]::UtcNow.AddSeconds(15)
+          while (-not (Test-Path ftp-server.ready) -and [DateTime]::UtcNow -lt $deadline) {
+              Start-Sleep -Milliseconds 100
+          }
+          if (-not (Test-Path ftp-server.ready)) { throw 'FTP server did not start' }
+
+          pktmon filter remove | Out-Null
+          pktmon filter add -p 445 | Out-File -Encoding utf8 results/pktmon-filter.txt
+          pktmon start --capture --pkt-size 0 --file-name results/pktmon.etl | Out-File -Encoding utf8 results/pktmon-start.txt
+
+          $oldUserProfile = $env:USERPROFILE
+          $oldAppData = $env:APPDATA
+          $oldLocalAppData = $env:LOCALAPPDATA
+          $env:USERPROFILE = $env:FZ_PROFILE
+          $env:APPDATA = $env:FZ_APPDATA
+          $env:LOCALAPPDATA = $env:FZ_LOCALAPPDATA
+
+          try {
+              $fz = Start-Process -FilePath $env:FZ_EXE -ArgumentList @('ftp://test:test@127.0.0.1:2121/') -PassThru
+              $deadline = [DateTime]::UtcNow.AddSeconds(35)
+              while (-not (Test-Path listing-served.marker) -and [DateTime]::UtcNow -lt $deadline -and -not $fz.HasExited) {
+                  Start-Sleep -Milliseconds 200
+              }
+              if (-not (Test-Path listing-served.marker)) {
+                  throw 'FileZilla did not retrieve the remote listing'
+              }
+
+              # Allow virtual list rendering and Shell icon/type requests to complete.
+              Start-Sleep -Seconds 12
+          }
+          finally {
+              $env:USERPROFILE = $oldUserProfile
+              $env:APPDATA = $oldAppData
+              $env:LOCALAPPDATA = $oldLocalAppData
+              if ($fz -and -not $fz.HasExited) { $fz.Kill($true) }
+              'stop' | Set-Content ftp-server.stop
+              if ($server -and -not $server.WaitForExit(5000)) { $server.Kill($true) }
+              pktmon stop | Out-File -Encoding utf8 results/pktmon-stop.txt
+          }
+
+          Copy-Item ftp-server.log results/ftp-server.log
+          if (Test-Path listing-served.marker) { Copy-Item listing-served.marker results/listing-served.marker }
+          Copy-Item filezilla-build.txt results/filezilla-build.txt
+          Copy-Item -Recurse -Force $env:FZ_APPDATA results/FileZilla-profile
+
+          pktmon format results/pktmon.etl -o results/pktmon.txt | Out-File -Encoding utf8 results/pktmon-format.txt
+          Get-Content results/pktmon.txt | Select-String -Pattern '192\.0\.2\.(20|21)|445' |
+              Set-Content -Encoding utf8 results/pktmon-relevant.txt
+
+          $ordinary = Select-String -Path results/pktmon-relevant.txt -Pattern '192\.0\.2\.20\.445' -Quiet
+          $shortcut = Select-String -Path results/pktmon-relevant.txt -Pattern '192\.0\.2\.21\.445' -Quiet
+          "ordinary_txt_smb=$ordinary" | Set-Content results/verdict.txt
+          "shortcut_lnk_smb=$shortcut" | Add-Content results/verdict.txt
+
+          Get-Content results/filezilla-build.txt
+          Get-Content results/ftp-server.log
+          Get-Content results/verdict.txt
+          Get-Content results/pktmon-relevant.txt
+
+          if (-not $shortcut) { throw 'No SMB attempt observed for remote UNC .lnk entry' }
+
+      - name: Upload end-to-end evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: filezilla-3.71.1-product-unc-results
+          path: results/**
+          if-no-files-found: error
+          retention-days: 7
