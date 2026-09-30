@@ -91,17 +91,19 @@ jobs:
           & cl.exe /nologo /EHsc /W4 shell_probe.cpp shell32.lib user32.lib /Fe:shell_probe.exe
           if ($LASTEXITCODE -ne 0) { throw "cl.exe failed: $LASTEXITCODE" }
 
-      - name: Run callback tests
+      - name: Observe outbound SMB attempts
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force results | Out-Null
 
-          # Free TCP/445 from the local SMB server while keeping the SMB client active.
-          Stop-Service -Name LanmanServer -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 2
+          # TEST-NET addresses are non-routable documentation space. There is no
+          # SMB responder and this test never reads or captures credentials.
+          pktmon filter remove | Out-Null
+          pktmon filter add -p 445 | Out-File -Encoding utf8 results/pktmon-filter.txt
+          pktmon start --capture --pkt-size 0 --file-name results/pktmon.etl | Out-File -Encoding utf8 results/pktmon-start.txt
 
-          function Invoke-CallbackCase {
+          function Invoke-ProbeCase {
               param(
                   [Parameter(Mandatory=$true)][string]$Case,
                   [Parameter(Mandatory=$true)][string]$HostAddress,
@@ -109,76 +111,39 @@ jobs:
                   [Parameter(Mandatory=$true)][string]$Mode
               )
 
-              $callbackLog = Join-Path $PWD "results\\$Case-callback.txt"
-              $probeLog = Join-Path $PWD "results\\$Case-probe.txt"
+              $log = Join-Path $PWD "results\\$Case.txt"
+              $process = Start-Process -FilePath (Join-Path $PWD 'shell_probe.exe') `
+                  -ArgumentList @($HostAddress, $Name, $Mode) `
+                  -RedirectStandardOutput $log -RedirectStandardError "$log.stderr" -PassThru
 
-              $listenerJob = Start-Job -ArgumentList $callbackLog -ScriptBlock {
-                  param([string]$Log)
-                  $ErrorActionPreference = 'Stop'
-                  $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, 445)
-                  try {
-                      $listener.Start()
-                      $deadline = [DateTime]::UtcNow.AddSeconds(8)
-                      $connected = $false
-                      while ([DateTime]::UtcNow -lt $deadline) {
-                          if ($listener.Pending()) {
-                              $client = $listener.AcceptTcpClient()
-                              try {
-                                  # Deliberately do not read any bytes or credentials.
-                                  "CALLBACK remote=$($client.Client.RemoteEndPoint) local=$($client.Client.LocalEndPoint)" |
-                                      Set-Content -Encoding ascii $Log
-                              }
-                              finally {
-                                  $client.Close()
-                              }
-                              $connected = $true
-                              break
-                          }
-                          Start-Sleep -Milliseconds 50
-                      }
-                      if (-not $connected) {
-                          'NO_CALLBACK' | Set-Content -Encoding ascii $Log
-                      }
-                  }
-                  catch {
-                      "LISTENER_ERROR: $($_.Exception.Message)" | Set-Content -Encoding ascii $Log
-                      throw
-                  }
-                  finally {
-                      $listener.Stop()
-                  }
+              # Sample connection state while the API is trying to resolve the UNC path.
+              $states = @()
+              for ($i = 0; $i -lt 50 -and -not $process.HasExited; ++$i) {
+                  $states += Get-NetTCPConnection -RemoteAddress $HostAddress -RemotePort 445 -ErrorAction SilentlyContinue |
+                      Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess
+                  Start-Sleep -Milliseconds 100
               }
-
-              Start-Sleep -Milliseconds 750
-              & .\\shell_probe.exe $HostAddress $Name $Mode *>&1 | Set-Content -Encoding utf8 $probeLog
-
-              $completed = Wait-Job -Job $listenerJob -Timeout 12
-              if (-not $completed) {
-                  Stop-Job -Job $listenerJob
-                  Remove-Job -Job $listenerJob -Force
-                  throw "listener timed out in $Case"
+              if (-not $process.WaitForExit(15000)) {
+                  $process.Kill()
+                  Add-Content -Encoding utf8 $log 'PROBE_TIMEOUT'
               }
-
-              Receive-Job -Job $listenerJob -ErrorAction Stop | Out-Null
-              Remove-Job -Job $listenerJob -Force
-              if (-not (Test-Path $callbackLog)) {
-                  throw "listener produced no result in $Case"
-              }
-
-              "=== $Case ==="
-              Get-Content $probeLog
-              Get-Content $callbackLog
+              $states | Sort-Object RemoteAddress,State -Unique | Format-List | Out-File -Encoding utf8 "results/$Case-connections.txt"
           }
 
-          # Exact FileZilla flags, tested against an ordinary extension and a shortcut extension.
-          Invoke-CallbackCase -Case 'exact-txt' -HostAddress '127.0.0.2' -Name 'probe.txt' -Mode 'exact'
-          Invoke-CallbackCase -Case 'exact-lnk' -HostAddress '127.0.0.3' -Name 'probe.lnk' -Mode 'exact'
+          Invoke-ProbeCase -Case 'exact-txt' -HostAddress '192.0.2.10' -Name 'probe.txt' -Mode 'exact'
+          Invoke-ProbeCase -Case 'exact-lnk' -HostAddress '192.0.2.11' -Name 'probe.lnk' -Mode 'exact'
 
-          # Positive controls prove that the listener sees outbound UNC resolution attempts.
-          Invoke-CallbackCase -Case 'shell-control-lnk' -HostAddress '127.0.0.4' -Name 'probe.lnk' -Mode 'control'
-          Invoke-CallbackCase -Case 'attributes-control' -HostAddress '127.0.0.5' -Name 'probe.txt' -Mode 'attributes'
+          # Positive controls: these APIs must resolve the supplied UNC path.
+          Invoke-ProbeCase -Case 'shell-control-lnk' -HostAddress '192.0.2.12' -Name 'probe.lnk' -Mode 'control'
+          Invoke-ProbeCase -Case 'attributes-control' -HostAddress '192.0.2.13' -Name 'probe.txt' -Mode 'attributes'
+
+          pktmon stop | Out-File -Encoding utf8 results/pktmon-stop.txt
+          pktmon format results/pktmon.etl -o results/pktmon.txt | Out-File -Encoding utf8 results/pktmon-format.txt
+          Get-Content results/pktmon.txt | Select-String -Pattern '192\.0\.2\.(10|11|12|13)|445' |
+              Set-Content -Encoding utf8 results/pktmon-relevant.txt
 
           Get-ChildItem results | Format-Table -AutoSize
+          Get-Content results/pktmon-relevant.txt
 
       - name: Upload native results
         if: always()
